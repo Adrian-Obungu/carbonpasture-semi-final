@@ -1,0 +1,295 @@
+/* rest-api.js — full replacement with phone-map + demo credits
+   Keeps Fabric gateway behaviour and adds:
+   - POST /registerPhone
+   - GET  /lookupPhone/:phone
+   - GET  /credits/:farmerID
+   - POST /credits/award
+   - awards 1 demo credit automatically on successful POST /records
+*/
+const express = require('express');
+const bodyParser = require('body-parser');
+const roleAuth = require('./middleware/roleAuth');
+const fs = require('fs').promises;
+const path = require('path');
+
+
+// connectGateway may return either { contract, gateway, client } or { gateway, client, contract }
+let connectGateway;
+try {
+  connectGateway = require('./src/app').connectGateway || require('./src/app').initializeGateway || require('./src/app');
+} catch (e) {
+  connectGateway = null;
+  console.error('WARN: could not require ./src/app — will attempt to require at runtime:', e.message);
+}
+
+const PORT = process.env.PORT || 3000;
+const CONTRACT_RETRY_MS = parseInt(process.env.CONTRACT_RETRY_MS || '30000', 10);
+const CONTRACT_RETRY_INTERVAL = parseInt(process.env.CONTRACT_RETRY_INTERVAL || '1000', 10);
+
+const app = express();
+app.use(bodyParser.json());
+app.use((req, res, next) => { console.log(">>> REQ", req.method, req.url); next(); });
+
+// Auth middleware
+if (process.env.DISABLE_AUTH === 'true') {
+  console.warn('⚠️  Auth middleware disabled for testing');
+} else {
+  app.use(roleAuth());
+}
+
+// FILES & DATA DIR
+const DATA_DIR = path.join(__dirname, 'data');
+const PHONE_MAP_FILE = path.join(DATA_DIR, 'phone-map.json');
+const CREDITS_FILE = path.join(DATA_DIR, 'credits.json');
+const CLEANUP_LOG = path.join(DATA_DIR, 'cleanup.log');
+
+async function ensureDataFiles() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  try {
+    await fs.access(PHONE_MAP_FILE);
+  } catch (e) {
+    await fs.writeFile(PHONE_MAP_FILE, JSON.stringify({ encrypted: false, map: {} }, null, 2));
+  }
+  try {
+    await fs.access(CREDITS_FILE);
+  } catch (e) {
+    await fs.writeFile(CREDITS_FILE, JSON.stringify({}, null, 2));
+  }
+}
+async function readJson(file) {
+  const raw = await fs.readFile(file, 'utf8');
+  return JSON.parse(raw || '{}');
+}
+async function writeJson(file, obj) {
+  await fs.writeFile(file, JSON.stringify(obj, null, 2));
+}
+
+// phone map helpers
+async function lookupPhone(phoneRaw) {
+  const phone = String(phoneRaw || '').trim();
+  const m = await readJson(PHONE_MAP_FILE);
+  return m.map && m.map[phone] ? m.map[phone] : null;
+}
+
+async function setPhoneMapping(phoneRaw, data) {
+  const phone = String(phoneRaw || '').trim();
+  const m = await readJson(PHONE_MAP_FILE);
+  if (!m.map) m.map = {};
+  m.map[phone] = { ...data, updatedAt: new Date().toISOString() };
+  await writeJson(PHONE_MAP_FILE, m);
+  return m.map[phone];
+}
+
+// credits helpers (simple ledger)
+async function getCreditsForFarmer(farmerID) {
+  const all = await readJson(CREDITS_FILE);
+  return all[farmerID] || { balance: 0, history: [] };
+}
+async function awardCredits(farmerID, amount = 1, reason = 'award', meta = {}) {
+  if (!farmerID) throw new Error('missing farmerID');
+  const all = await readJson(CREDITS_FILE);
+  if (!all[farmerID]) all[farmerID] = { balance: 0, history: [] };
+  const entry = {
+    id: `cred${Date.now()}`,
+    amount: Number(amount),
+    reason,
+    meta,
+    timestamp: new Date().toISOString()
+  };
+  all[farmerID].balance = Number(all[farmerID].balance || 0) + Number(amount);
+  all[farmerID].history.push(entry);
+  await writeJson(CREDITS_FILE, all);
+  return { balance: all[farmerID].balance, entry };
+}
+
+// readiness state
+let contractConn = null;
+let contractReady = false;
+
+// ALWAYS respond immediately to /test and /health
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/test', (_req, res) => res.send(contractReady ? 'pong' : 'Service initializing'));
+
+// Register phone -> farm mapping (simple, off-chain PII handling)
+app.post('/registerPhone', async (req, res) => {
+  try {
+    const phone = req.body.phone;
+    const farmID = req.body.farmID;
+    if (!phone || !farmID) return res.status(400).json({ error: 'phone and farmID required' });
+    await ensureDataFiles();
+    const mapping = await setPhoneMapping(phone, { farmID });
+    return res.json({ success: true, phone, mapping });
+  } catch (err) {
+    console.error('Error registerPhone:', err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// Lookup phone -> mapping
+app.get('/lookupPhone/:phone', async (req, res) => {
+  try {
+    const phone = decodeURIComponent(req.params.phone);
+    await ensureDataFiles();
+    const m = await lookupPhone(phone);
+    if (!m) return res.status(404).json({ error: 'not found' });
+    return res.json({ phone, ...m });
+  } catch (err) {
+    console.error('Error lookupPhone:', err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// Query credits for farmer
+app.get('/credits/:farmerID', async (req, res) => {
+  try {
+    const farmerID = req.params.farmerID;
+    await ensureDataFiles();
+    const c = await getCreditsForFarmer(farmerID);
+    return res.json({ farmerID, ...c });
+  } catch (err) {
+    console.error('Error credits:', err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// Manual award endpoint (useful for admin/testing)
+app.post('/credits/award', async (req, res) => {
+  try {
+    const { farmerID, amount = 1, reason = 'award', meta = {} } = req.body;
+    if (!farmerID) return res.status(400).json({ error: 'farmerID required' });
+    await ensureDataFiles();
+    const result = await awardCredits(farmerID, amount, reason, meta);
+    return res.json({ success: true, farmerID, ...result });
+  } catch (err) {
+    console.error('Error award credits:', err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// POST /records -> IssueRecord: sends single JSON-string arg
+app.post('/records', async (req, res) => {
+  if (!contractReady) return res.status(503).json({ error: 'Service initializing' });
+
+  try {
+    const record = {
+      ID: req.body.ID,
+      farmID: req.body.farmID,
+      methanePPM: req.body.methanePPM,
+      timestamp: req.body.timestamp || new Date().toISOString(),
+    };
+    const contract = contractConn.contract || contractConn;
+    await contract.submitTransaction('IssueRecord', JSON.stringify(record));
+    // Award 1 demo credit automatically to farmID for each saved reading
+    try {
+      await ensureDataFiles();
+      const award = await awardCredits(record.farmID, 1, 'daily-reading', { recordID: record.ID });
+      return res.json({ success: true, ID: record.ID, award });
+    } catch (awardErr) {
+      console.error('Warning: record saved but failed to award credit:', awardErr && awardErr.message ? awardErr.message : awardErr);
+      return res.json({ success: true, ID: record.ID, awardError: awardErr && awardErr.message ? awardErr.message : String(awardErr) });
+    }
+  } catch (err) {
+    console.error('Error issuing record:', err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// GET /records/:id -> ReadRecord (unchanged behaviour)
+app.get('/records/:id', async (req, res) => {
+  if (!contractReady) return res.status(503).json({ error: 'Service initializing' });
+
+  const { id } = req.params;
+  try {
+    const contract = contractConn.contract || contractConn;
+    const resultBytes = await contract.evaluateTransaction('ReadRecord', id);
+    const resultString = resultBytes.toString('utf8').trim();
+
+    try {
+      let record;
+      try {
+        record = JSON.parse(resultString);
+      } catch (parseErr) {
+        const asciiCsvRegex = /^\s*\d+(?:\s*,\s*\d+)*\s*$/;
+        if (asciiCsvRegex.test(resultString)) {
+          const maybeAscii = resultString
+            .split(',')
+            .map(n => String.fromCharCode(Number(n)))
+            .join('');
+          record = JSON.parse(maybeAscii);
+        } else {
+          throw parseErr;
+        }
+      }
+
+      if (!record || Object.keys(record).length === 0) {
+        return res.status(404).json({ error: `Record ${id} not found` });
+      }
+      return res.json(record);
+    } catch (e) {
+      console.error("❌ Parse failure:", e && e.message ? e.message : e, "Raw:", resultString);
+      return res.status(500).json({ error: "Invalid JSON response", raw: resultString });
+    }
+  } catch (err) {
+    console.error(`❌ Failed to read record ${id}:`, err && err.message ? err.message : err);
+    return res.status(500).json({ error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// Start HTTP server
+const server = app.listen(PORT, '0.0.0.0', () =>
+  console.log(`🚀 REST API listening on http://127.0.0.1:${PORT}`)
+);
+
+// Background: try to load gateway & contract with throttled retries
+async function tryConnect() {
+  await ensureDataFiles();
+  const start = Date.now();
+  const timeout = CONTRACT_RETRY_MS;
+  console.log('DEBUG: Starting background Fabric Gateway initialization...');
+  while (Date.now() - start < timeout) {
+    try {
+      if (!connectGateway) {
+        try {
+          connectGateway = require('./src/app').connectGateway || require('./src/app').initializeGateway || require('./src/app');
+        } catch (e) {
+          console.debug('DEBUG: require(./src/app) failed, will retry:', e.message);
+        }
+      }
+      if (!connectGateway) {
+        await new Promise(r => setTimeout(r, CONTRACT_RETRY_INTERVAL));
+        continue;
+      }
+
+      const maybeConn = await Promise.race([
+        connectGateway(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('connectGateway timeout')), 5000))
+      ]);
+
+      if (maybeConn) {
+        const contract = maybeConn.contract || maybeConn;
+        if (contract && typeof contract.evaluateTransaction === 'function') {
+          contractConn = maybeConn;
+          contractReady = true;
+          console.log('DEBUG: Gateway initialized and contract available.');
+          return;
+        }
+      }
+      console.debug('DEBUG: Gateway initialized but contract not ready; retrying...');
+    } catch (e) {
+      console.debug('DEBUG: connectGateway attempt error:', e && e.message ? e.message : String(e));
+    }
+    await new Promise(r => setTimeout(r, CONTRACT_RETRY_INTERVAL));
+  }
+  console.error('ERROR: Gateway initialized but contract not available after retries.');
+}
+
+tryConnect().catch(e => console.error('ERROR in background tryConnect:', e && e.stack ? e.stack : e));
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\\n🛑 Shutting down server gracefully...');
+  server.close(() => {
+    console.log('✅ Server closed. Exiting.');
+    process.exit(0);
+  });
+});

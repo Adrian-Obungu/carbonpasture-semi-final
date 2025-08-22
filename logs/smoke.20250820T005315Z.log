@@ -1,0 +1,17 @@
+SMOKE RUN: Wed Aug 20 00:53:15 UTC 2025
+- Checking listeners on :3000 and :4000
+  :3000 OK
+  :4000 OK
+- /health
+  API /health OK
+- USSD menu
+  USSD menu OK
+- POST /records -> smoke1755651195
+  POST OK: {"success":true,"ID":"smoke1755651195"}
+- GET /records/smoke1755651195
+  GET OK: {"ID":"smoke1755651195","farmID":"farmSmoke","methanePPM":7.77,"timestamp":"2025-08-20T00:53:15Z"}
+- USSD end-to-end (1*smokeFarm*12.34)
+  USSD submit OK
+- /_internal/phone-map
+  phone-map OK
+SMOKE TEST: PASS
